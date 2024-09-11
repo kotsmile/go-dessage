@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -32,25 +33,24 @@ func (p Peer) Addr() string {
 }
 
 type Server struct {
-	addr string
-	user string
+	addr     string
+	username string
 
 	listener  net.Listener
 	messageCh chan Message
-	peers     map[string]Peer
+	peers     sync.Map // map[string]Peer
 	log       *log.Entry
 
 	onMessage func(Message)
 }
 
-func NewServer(addr string, name string) *Server {
+func NewServer(addr string, username string) *Server {
 	return &Server{
-		addr: addr,
-		user: name,
-
+		addr:      addr,
+		username:  username,
 		messageCh: make(chan Message, 1024),
-		peers:     make(map[string]Peer),
-		log:       log.WithField("server", addr),
+
+		log: log.WithField("server", addr),
 	}
 }
 
@@ -58,7 +58,7 @@ func (s *Server) WithOnMessage(onMessage func(Message)) {
 	s.onMessage = onMessage
 }
 
-func (s Server) Addr() string {
+func (s *Server) Addr() string {
 	return s.addr
 }
 
@@ -90,7 +90,7 @@ func (s *Server) Dial(addr string) error {
 
 func (s *Server) SendMessage(text string, messageType MessageType) {
 	s.messageCh <- Message{
-		User:      s.user,
+		User:      s.username,
 		Text:      text,
 		Timestamp: time.Now().Unix(),
 		Type:      messageType,
@@ -135,7 +135,7 @@ func (s *Server) handleConn(conn net.Conn, outbound bool) {
 
 	defer func() {
 		s.log.WithField("remoteAddr", remoteAddr).Debugln("close connection")
-		delete(s.peers, remoteAddr)
+		s.peers.Delete(remoteAddr)
 		if err := conn.Close(); err != nil {
 			s.log.WithField("remoteAddr", remoteAddr).Errorf("failed to close connection: %v", err)
 			return
@@ -143,7 +143,7 @@ func (s *Server) handleConn(conn net.Conn, outbound bool) {
 	}()
 
 	peer := NewPeer(conn, outbound)
-	s.peers[peer.Addr()] = peer
+	s.peers.Store(remoteAddr, &peer)
 
 	if !outbound {
 		s.SendMessage("connect", ConnectType)
@@ -173,17 +173,22 @@ func (s *Server) handleMessage() {
 			s.onMessage(message)
 		}
 
-		for remoteAddr, peer := range s.peers {
+		s.peers.Range(func(remoteAddr_ any, peer_ any) bool {
+			remoteAddr, _ := remoteAddr_.(string)
+			peer, _ := peer_.(*Peer)
+
 			if remoteAddr == message.Address {
-				continue
+				return true
 			}
 
 			if err := peer.encoder.Encode(message); err != nil {
 				s.log.WithField("remoteAddr", remoteAddr).
 					WithField("message", message).
 					Errorf("failed to send message: %v", err)
-				continue
+				return true
 			}
-		}
+
+			return true
+		})
 	}
 }
